@@ -279,7 +279,7 @@ def fused_recurrent_dplr_delta_rule(
     ckpt_steps: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
-    This function computes the recurrence S_t = S_t @ (I + a_t b_t^T) + v_t k_t^T in a recurrent manner.
+    This function computes the recurrence S_t = S_t @ (D_t + a_t b_t^T) + v_t k_t^T in a recurrent manner.
 
     Args:
         q (torch.Tensor):
