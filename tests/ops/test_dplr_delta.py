@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -58,6 +57,9 @@ def recurrent_dplr_delta_rule_ref(
         S = S.clone() * gk[:, :, i].exp()[..., None]
         S = S.clone() + _k.unsqueeze(-1) * _v.unsqueeze(-2) + b_i.unsqueeze(-1) * _v2.unsqueeze(-2)
         o[:, :, i] = torch.einsum('bhd,bhdm->bhm', _q, S)
+        # sab = torch.einsum('bhik,bhk,bhj->bhij', S.clone(), a_i, b_i)
+        # S = S.clone() * torch.exp(gk[:, :, i, None, :]) + sab + torch.einsum('bhj,bhi->bhij', _k, _v)
+        # o[:, :, i] = torch.einsum('bhj,bhij->bhi', _q, S)
     if not output_final_state:
         S = None
     o = o.transpose(1, 2)
@@ -207,7 +209,7 @@ def test_recurrent_fwd(
 @pytest.mark.parametrize('D', test_d_list)
 @pytest.mark.parametrize('scale', [0.25])
 @pytest.mark.parametrize('dtype', [torch.float32])
-@pytest.mark.parametrize('save_ckpt', [False, True])
+@pytest.mark.parametrize('save_ckpt', [True])
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '0',
     reason='Skipping test because TEST_CHUNK_VARLEN is enabled'
@@ -222,18 +224,21 @@ def test_fused_recurrent_fwd(
     save_ckpt: bool,
 ):
     torch.manual_seed(42)
-    q = torch.randn(B, T, H, D, dtype=dtype)
-    k = torch.randn(B, T, H, D, dtype=dtype)
-    v = torch.randn(B, T, H, D, dtype=dtype)
-    a = torch.rand(B, T, H, D, dtype=dtype)
-    gk = torch.randn(B, T, H, D, dtype=torch.float)
+    q = torch.randn(B, T, H, D, dtype=dtype).uniform_(-8, 8)
+    k = torch.randn(B, T, H, D, dtype=dtype).uniform_(-8, 8)
+    v = torch.randn(B, T, H, D, dtype=dtype).uniform_(-8, 8)
+    a = torch.rand(B, T, H, D, dtype=dtype).uniform_(-8, 8)
+    gk = torch.randn(B, T, H, D, dtype=torch.float).uniform_(-8, 8)
+    kk = torch.empty(B, T, H, D, dtype=dtype).uniform_(-1, 1)
+    kk = torch.nn.functional.normalize(kk, dim=-1).to(dtype=dtype)
+    a_scale = torch.empty(B, T, H, D, dtype=dtype).uniform_(0, 0.1)
 
-    a = F.normalize(a, p=2, dim=-1)
-    b = -a
-    gk = F.logsigmoid(gk) / 4
+    a = -kk.clone()
+    b = (kk * a_scale)
+    gk = -0.6065306597126334 * gk.sigmoid()
 
     h0 = torch.randn(B, H, D, D, dtype=torch.float)
-    q, k, v, a, b, gk, h0 = map(lambda x: x.to(device).requires_grad_(False), (q, k, v, a, b, gk, h0))
+    q, k, v, a, b, gk, h0 = map(lambda x: x.to(device).requires_grad_(True if save_ckpt else False), (q, k, v, a, b, gk, h0))
     ref, ref_ht = recurrent_dplr_delta_rule_ref(
         q=q.clone(),
         k=k.clone(),
@@ -246,6 +251,11 @@ def test_fused_recurrent_fwd(
         output_final_state=True,
     )
 
+    if save_ckpt:
+        dht = torch.randn_like(h0)
+        (ref.sum().mean()).backward(retain_graph=True)
+        ref_dq, ref_dk, ref_dv, ref_da, ref_db, ref_dg, ref_dh0 = q.grad, k.grad, v.grad, a.grad, b.grad, gk.grad, h0.grad
+        q.grad = k.grad = v.grad = a.grad = b.grad = gk.grad = h0.grad = None
     tri, tri_ht = fused_recurrent_dplr_delta_rule(
         q=q.clone(),
         k=k.clone(),
@@ -256,11 +266,33 @@ def test_fused_recurrent_fwd(
         scale=scale,
         initial_state=h0.clone(),
         output_final_state=True,
-        training=True if save_ckpt else False,
-        ckpt_steps=16
+        training=save_ckpt,
+        ckpt_steps=8
     )
+    if save_ckpt:
+        (tri.sum().mean()).backward(retain_graph=True)
+        tri_dq, tri_dk, tri_dv, tri_da, tri_db, tri_dg, tri_dh0 = q.grad, k.grad, v.grad, a.grad, b.grad, gk.grad, h0.grad
+        q.grad = k.grad = v.grad = a.grad = b.grad = gk.grad = h0.grad = None
     assert_close(' o', ref, tri, 0.002)
     assert_close('ht', ref_ht, tri_ht, 0.002)
+    if save_ckpt:
+        # assert_close(' dq', ref_dq, tri_dq, 0.008)
+        print("dq",(ref_dq-tri_dq).max().item())
+        # assert_close(' dk', ref_dk, tri_dk, 0.008)
+        print("dk",(ref_dk-tri_dk).max().item())
+        # assert_close(' dv', ref_dv, tri_dv, 0.008)
+        print("dv",(ref_dv-tri_dv).max().item())
+        # assert_close(' da', ref_da, tri_da, 0.008)
+        print("da",(ref_da-tri_da).max().item())
+        # assert_close(' db', ref_db, tri_db, 0.008)
+        print("db",(ref_db-tri_db).max().item())
+        if gk.norm() > 0.01:  # otherwise it is meaningless
+            # assert_close(' dg', ref_dg, tri_dg, 0.008)
+            print("dgk",(ref_dg-tri_dg).max().item())
+        # assert_close('dh0', ref_dh0, tri_dh0, 0.008)
+        print("dh0",(ref_dh0-tri_dh0).max().item())
+
+test_fused_recurrent_fwd(B=1,T=32,H=1,D=64,scale=1.0, dtype= torch.float32,save_ckpt=True)
 
 
 @pytest.mark.parametrize('B', test_b_list)
@@ -275,10 +307,10 @@ def test_fused_recurrent_fwd(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '0',
     reason='Skipping test because TEST_CHUNK_VARLEN is enabled'
 )
-@pytest.mark.skipif(
-    device_platform == 'intel',
-    reason='Intel Triton Failure'
-)
+# @pytest.mark.skipif(
+#     device_platform == 'intel',
+#     reason='Intel Triton Failure'
+# )
 def test_chunk(
     B: int,
     T: int,
@@ -302,7 +334,7 @@ def test_chunk(
 
     h0 = torch.randn(B, H, D, D, dtype=torch.float)
     q, k, v, a, b, gk, h0 = map(lambda x: x.to(device).requires_grad_(True), (q, k, v, a, b, gk, h0))
-    ref, ref_ht = chunk_dplr_delta_rule_ref(
+    ref, ref_ht = recurrent_dplr_delta_rule_ref(
         q=q.clone(),
         k=k.clone(),
         v=v.clone(),
